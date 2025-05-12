@@ -62,8 +62,13 @@ import {
   Divider,
   TableContainer,
   Tabs,
-  Tab
+  Tab,
+  IconButton,
+  Badge,
+  Menu,
+  Popover
 } from "@mui/material";
+import NotificationsIcon from '@mui/icons-material/Notifications';
 
 import { useTheme } from '@mui/material/styles';
 
@@ -171,6 +176,8 @@ const TelemetryDashboard = () => {
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
   const [realtimeEnabled, setRealtimeEnabled] = useState(true);
   const [localAlarmCount, setLocalAlarmCount] = useState(0);
+  // Track if we've loaded initial alarms data
+  const [alarmsInitialized, setAlarmsInitialized] = useState(false);
   
   // Refs to track subscriptions
   const activeDeviceRef = useRef(null);
@@ -202,32 +209,89 @@ const TelemetryDashboard = () => {
   
   // Fetch alarm count from the backend
   useEffect(() => {
+    // Initial alarm count and notifications are loaded from API, subsequent updates are via WebSocket only
     const fetchAlarmCount = async () => {
-      try {
-        const response = await axios.get('http://localhost:5000/api/alarms');
-        const alarms = response.data;
-        setLocalAlarmCount(alarms.length);
-      } catch (error) {
-        console.error('Error fetching alarm count:', error);
+      if (!selectedDevice && selectedPlant) {
+        // If device is not selected but plant is, try to load alarms for the plant
+        try {
+          console.log(' Initial fetch of alarm count and notifications via API');
+          setDataSource('loading'); // Show loading state
+          
+          const response = await axios.get('http://localhost:5000/api/alarms');
+          const alarms = response.data;
+          
+          // Update alarm count
+          setLocalAlarmCount(alarms.length);
+          
+          // Store the most recent 5 alarms for the notifications dropdown
+          if (alarms.length > 0 && !alarmsInitialized) {
+            const formattedAlarms = alarms.slice(0, 5).map(alarm => ({
+              id: alarm._id || `alarm-${Date.now()}-${Math.random()}`,
+              alarmCode: alarm.AlarmCode || '',
+              description: alarm.AlarmDescription || '',
+              timestamp: new Date(alarm.CreatedTimestamp || new Date()).toISOString(),
+              deviceName: alarm.DeviceName || 'Unknown Device',
+              isRead: alarm.IsRead || false
+            }));
+            
+            setRecentNotifications(formattedAlarms);
+            setAlarmsInitialized(true); // Mark that we've initialized alarms
+            console.log(' Loaded initial notifications:', formattedAlarms);
+          }
+          
+          setDataSource('api'); // Mark data as coming from API
+          
+          // After initial load, set a timeout to ensure we switch to WebSocket
+          // This helps if WebSocket connection is slow or if API is faster
+          setTimeout(() => {
+            if (socketService.isConnected()) {
+              setDataSource('websocket'); // Now using WebSockets
+              console.log(' Switched to WebSocket for alarm updates');
+            }
+          }, 2000);
+          
+        } catch (error) {
+          console.error('Error fetching alarm count:', error);
+          // If API fails, still try to use WebSocket data
+          setDataSource('websocket');
+        }
       }
     };
     
     fetchAlarmCount();
-    // Set up interval to refresh alarm count
+    
+    // Refresh alarm count periodically if needed
     const interval = setInterval(fetchAlarmCount, 30000);
+  
     return () => clearInterval(interval);
-  }, []);
+  }, [selectedDevice, selectedPlant, alarmsInitialized]);
 
   const navigate = useNavigate();
 
   const handleTabChange = (event, newValue) => {
+    // Update URL with the new tab
+    const searchParams = new URLSearchParams(location.search);
+    searchParams.set('tab', newValue);
+    navigate(`?${searchParams.toString()}`);
+    
+    // Store current tab
     setActiveTab(newValue);
-    const params = new URLSearchParams(location.search);
-    params.set('tab', newValue);
-    navigate({ search: params.toString() });
+    
+    // When switching back to status tab, ensure we maintain data
+    if (newValue === 'status') {
+      // If we have deviceData but latestEntry is null, restore it
+      if (deviceData && (!latestEntry || !latestEntry.temperature)) {
+        console.log('🔄 Restoring device data after tab switch');
+        setLatestEntry({
+          temperature: deviceData.temperature || 0,
+          humidity: deviceData.humidity || 0,
+          oilLevel: deviceData.oilLevel || 0
+        });
+      }
+    }
   };
 
-
+  // Chart configuration options
   const chartOptions = {
     responsive: true,
     maintainAspectRatio: false,
@@ -268,23 +332,24 @@ const TelemetryDashboard = () => {
       }
     };
     fetchPlants();
-  }, []);  // Load initial alarm count
-  useEffect(() => {
-    const fetchAlarmCount = async () => {
-      if (!selectedDevice) return;
-      
-      try {
-        // If you have an API endpoint for alarm count, use it here
-        // Example: const response = await axios.get(`/api/alarms/count?deviceId=${selectedDevice}`);
-        // setLocalAlarmCount(response.data.count);
-        
-        // For now, we'll use 0 as the initial count
-        setLocalAlarmCount(0);
-      } catch (error) {
-        console.error('Error fetching alarm count:', error);
-      }
-    };
+  }, []);  // Function to fetch alarm count (defined at component scope level so it can be used by WebSocket handlers)
+  const fetchAlarmCount = useCallback(async () => {
+    if (!selectedDevice) return;
     
+    try {
+      // If you have an API endpoint for alarm count, use it here
+      // Example: const response = await axios.get(`/api/alarms/count?deviceId=${selectedDevice}`);
+      // setLocalAlarmCount(response.data.count);
+      
+      // For now, we'll just increment the local count
+      console.log('Refreshing alarm count');
+    } catch (error) {
+      console.error('Error fetching alarm count:', error);
+    }
+  }, [selectedDevice]);
+
+  // Load initial alarm count
+  useEffect(() => {
     fetchAlarmCount();
     
     // Set up interval to refresh alarm count (optional)
@@ -293,40 +358,130 @@ const TelemetryDashboard = () => {
     return () => clearInterval(interval);
   }, [selectedDevice]);
   
-  // When using WebSockets, block telemetry API calls
-  useEffect(() => {
-    if (realtimeEnabled) {
-      console.log('🛑 BLOCKING API CALLS: Setting up telemetry API blocker');
-      
-      // Create a function to patch the fetch API
-      const originalFetch = window.fetch;
-      window.fetch = function(url, options) {
-        // Block telemetry API calls when WebSockets are active
-        if (typeof url === 'string' && 
-           (url.includes('/api/telemetry') || 
-            url.includes('telemetryService'))) {
-          console.log(`🛑 BLOCKED API CALL to: ${url} - using WebSockets instead`);
-          // Return a mock response
-          return Promise.resolve({
-            ok: true,
-            json: () => Promise.resolve([])
-          });
-        }
-        return originalFetch.apply(this, arguments);
-      };
-      
-      // Return cleanup function
-      return () => {
-        window.fetch = originalFetch;
-        console.log('🔄 Restored original fetch API');
-      };
-    }
-  }, [realtimeEnabled]);
+  // Define API fetch functions using useCallback to prevent unnecessary re-renders
+  
+  // Function to fetch latest telemetry entry via API
+  const fetchLatestEntry = useCallback(async () => {
+    if (!selectedDevice) return;
+  
+    try {
+      const data = await getLatestTelemetryEntry(selectedDevice);
+      console.log("Latest telemetry entry:", data);
+      if (data) {
+        // Properly normalize the data structure
+        const normalized = {
+          alerts: Array.isArray(data.alerts) ? data.alerts : [],
+          temperature: typeof data.temperature === 'object' ? 
+            data.temperature.value : 
+            typeof data.temperature === 'number' ? 
+              data.temperature : 0,
+          humidity: typeof data.humidity === 'object' ? 
+            data.humidity.value : 
+            typeof data.humidity === 'number' ? 
+              data.humidity : 0,
+          oilLevel: typeof data.oilLevel === 'object' ? 
+            data.oilLevel.value : 
+            typeof data.oilLevel === 'number' ? 
+              data.oilLevel : 0
+        };
 
-  // Initialize WebSocket connection
+        console.log("Normalized latest entry:", normalized);
+        setLatestEntry(normalized);
+        setConnectionStatus("connected");
+      } else {
+        setLatestEntry(null);
+        setConnectionStatus("no data");
+      }
+    } catch (error) {
+      console.error("❌ Error fetching latest telemetry:", error);
+      setLatestEntry(null);
+      setConnectionStatus("error");
+    }
+  }, [selectedDevice]);
+
+  // Function to fetch realtime telemetry data via API
+  const fetchRealtimeData = useCallback(async () => {
+    if (!selectedDevice) return;
+
+    try {
+      const data = await getRealtimeTelemetryData(selectedDevice);
+      setRealtimeData(data);
+    } catch (error) {
+      console.error("❌ Error fetching realtime data:", error);
+      setError("Failed to fetch realtime data.");
+    }
+  }, [selectedDevice]);
+  
+  // Function to fetch historical telemetry data via API
+  const fetchHistoricalData = useCallback(async () => {
+    if (!selectedDevice) {
+      setTelemetryData([]);
+      return;
+    }
+   
+    try {
+      const data = await getTelemetryData(selectedDevice);
+      if (data?.length > 0) {
+        const processedData = data.map(entry => ({
+          ...entry,
+          temperature: entry.temperature?.value || entry.temperature || 0,
+          oilLevel: entry.oilLevel?.value || entry.oilLevel || 0,
+          timestamp: entry.timestamp
+        }));
+        
+        setTelemetryData(processedData.slice(0, 20));
+        setError(null);
+      }
+    } catch (error) {
+      console.error("❌ Error fetching historical data:", error);
+      setError("Failed to fetch telemetry data.");
+    }
+  }, [selectedDevice]);
+  
+  // Track initial data loading state
+  const [initialDataLoaded, setInitialDataLoaded] = useState(false);
+  // Track data source for UI display
+  const [dataSource, setDataSource] = useState('loading');
+  // Add device data state to store current telemetry values
+  const [deviceData, setDeviceData] = useState({});
+  
+  // Function to add new data points to real-time graphs
+  const addRealtimeDataPoint = useCallback((data) => {
+    // Add the new data point to telemetryData for graph updates
+    // This is helpful to keep the graphs updating with real-time data
+    setTelemetryData(prevData => {
+      // If we have no previous data, just return the new data point as an array
+      if (!prevData || prevData.length === 0) {
+        return [data];
+      }
+      
+      // Create a copy of previous data and add the new point
+      const newData = [...prevData];
+      
+      // Add the new point at the beginning (most recent)
+      newData.unshift({
+        ...data,
+        // Ensure timestamp is properly formatted
+        timestamp: new Date(data.timestamp).toISOString()
+      });
+      
+      // Keep only the latest 50 points to prevent memory issues
+      return newData.slice(0, 50);
+    });
+  }, []);
+  
+  // Key useEffect to implement the hybrid approach: 
+  // 1. Initial data load via API
+  // 2. Then WebSockets for real-time updates
   useEffect(() => {
-    // Connect to WebSocket server
-    socketService.connect();
+    if (!selectedDevice) return;
+    
+    // Function to fetch latest telemetry entry via API
+
+  // Mark that we're starting to load initial data
+  window.initialDataLoadTime = Date.now();
+  setInitialDataLoaded(false);
+  setDataSource('loading');
     
     // Set up connection status handlers
     socketService.onConnect(() => {
@@ -361,64 +516,126 @@ const TelemetryDashboard = () => {
     };
   }, []);
   
+  // Add a safety timeout for initial data loading
+  useEffect(() => {
+    if (!selectedDevice || initialDataLoaded) return;
+    
+    // Set a timeout to force enable WebSocket data processing after 5 seconds
+    const forceEnableTimeout = setTimeout(() => {
+      if (!initialDataLoaded) {
+        console.log(`⚠️ API data loading timeout - forcing WebSocket data processing`);
+        setInitialDataLoaded(true);
+        setDataSource('websocket');
+        setLoading(false);
+      }
+    }, 5000); // 5 second timeout should be enough
+    
+    return () => clearTimeout(forceEnableTimeout);
+  }, [selectedDevice, initialDataLoaded]);
+  
   // Set up WebSocket data listeners
   useEffect(() => {
     if (!realtimeEnabled) return;
     
     // Handler for telemetry data
     const handleTelemetryData = (data) => {
-      const isEsp32_04 = (data.deviceId === 'esp32_04' || 
-                        (data.deviceName && data.deviceName.includes('esp32_04')) || 
-                        (data.device === 'esp32_04'));
+      // Check if this data is for our currently selected device
+      const dataDeviceId = data?.device || data?.deviceId || '';
+      const selectedDeviceMapping = deviceIdMap[selectedDevice] || '';
       
-      if (isEsp32_04) {
-        console.log('🔵 Received ESP32_04 WebSocket data:', data);
-      } else {
-        console.log('Received telemetry data via WebSocket:', data);
+      // Handle the case where API calls are timing out but WebSockets are working
+      if (!initialDataLoaded) {
+        const currentTime = Date.now();
+        const startTime = window.initialDataLoadTime || 0;
+        const loadTime = currentTime - startTime;
+        
+        // If we've been waiting for more than 5 seconds, force process the data
+        if (loadTime > 5000) {
+          console.log(`⚠️ Force processing WebSocket data after ${loadTime}ms wait`);
+          setInitialDataLoaded(true);
+          setDataSource('websocket');
+          setLoading(false);
+        } else {
+          console.log(`⏳ Initial API data still loading (${loadTime}ms) - will process WebSocket data later`);
+          return;
+        }
       }
       
-      // Force WebSocket connection status to connected
-      setConnectionStatus('connected');
+      console.log(`📶 Processing WebSocket telemetry for device: ${dataDeviceId}`);
+      setDataSource('websocket'); // Update data source indicator
       
-      // Format data to match API format - ensuring all field variations are handled
-      const formattedData = {
-        deviceId: data.deviceId || data.device || data.DeviceId || '',
-        deviceName: data.deviceName || data.DeviceName || data.deviceId || data.device || 'Unknown',
-        temperature: typeof data.temperature !== 'undefined' ? data.temperature : 
-                    typeof data.Temperature !== 'undefined' ? data.Temperature : 0,
-        humidity: typeof data.humidity !== 'undefined' ? data.humidity : 
-                 typeof data.Humidity !== 'undefined' ? data.Humidity : 0,
-        oilLevel: typeof data.oilLevel !== 'undefined' ? data.oilLevel : 
-                 typeof data.OilLevel !== 'undefined' ? data.OilLevel : 0,
-        timestamp: new Date(data.timestamp || data.Timestamp || new Date()),
-        plantName: data.plantName || data.PlantName || ''
-      };
-      
-      // Display debugging information
-      console.log('Formatted WebSocket data:', formattedData);
-      
-      // Update latest entry
-      setLatestEntry(formattedData);
-      
-      // Add to realtime data (keeping it limited to prevent memory issues)
-      setRealtimeData(prevData => {
-        const newData = [formattedData, ...prevData];
-        return newData.slice(0, 50); // Keep only the latest 50 entries
-      });
+      // Update UI state with the new data
+      if (data) {
+        // Format the data for UI components
+        const formattedData = {
+          timestamp: new Date(data.receivedTimestamp || data.timestamp || new Date()).toISOString(),
+          temperature: data.temperature || 0,
+          humidity: data.humidity || 0,
+          distance: data.distance || 0,
+          alcoholLevel: data.alcoholLevel || data.alcohol || 0,
+          oilLevel: data.oilLevel || 0,
+          deviceId: data.deviceId || data.device,
+          plantName: data.plantName
+        };
+        
+        // Log important values for monitoring
+        console.log(`📈 WebSocket data - Temp: ${formattedData.temperature}°C | Humidity: ${formattedData.humidity}% | Time: ${formattedData.timestamp}`);
+        
+        // Check if this data is for the currently selected device
+        const deviceId = data.deviceId || data.device;
+        
+        // Match WebSocket data to selected device (handle different ID formats)
+        const isForSelectedDevice = 
+          selectedDevice === deviceId || 
+          (deviceId && deviceId.toString().includes(selectedDevice)) || 
+          (selectedDevice && selectedDevice.toString().includes(deviceId));
+        
+        if (isForSelectedDevice) {
+          console.log(`🔵 Updating UI with real-time data via WebSocket`);
+          
+          // 1. Update latest telemetry entry (for metric circles)
+          setLatestEntry(prev => ({
+            ...prev,
+            temperature: formattedData.temperature,
+            humidity: formattedData.humidity,
+            oilLevel: formattedData.oilLevel
+          }));
+          
+          // 2. Update device data (for dashboard header)
+          setDeviceData(prevData => ({ ...prevData, ...formattedData }));
+          
+          // 3. Update real-time data table (add new entry at top)
+          setRealtimeData(prevData => {
+            // Create new array with new data at the beginning
+            return [formattedData, ...prevData.slice(0, 19)];
+          });
+          
+          // 4. Add new point to real-time graph
+          addRealtimeDataPoint(formattedData);
+          
+          // Force WebSocket connection status to connected
+          setConnectionStatus('connected');
+        }
+      }
     };
     
-    // Handler for alarm data
+    // Handler for alarm data - implements hybrid approach for alarms
+    // This only updates the alarm count, notification functionality moved to Layout component
     const handleAlarmData = (data) => {
-      console.log('Received alarm data via WebSocket:', data);
-      
-      // Increment alarm count
-      setLocalAlarmCount(prevCount => prevCount + 1);
-      
-      // Display alarm notification
-      toast.error(`Alarm: ${data.alarmDescription || data.AlarmDescription || 'Unknown'} (${data.deviceName || data.DeviceName || 'Unknown device'})`, {
-        position: "top-right",
-        autoClose: 5000,
-      });
+      // Only process data if we have it
+      if (data) {
+        console.log(`🚨 Received alarm data via WebSocket: ${data?.alarmCode || 'unknown alarm'}`);
+        
+        // Mark that data source is now WebSocket for alarms
+        if (dataSource !== 'websocket') {
+          setDataSource('websocket');
+          console.log('🔄 Data source changed to WebSocket for alarms');
+        }
+        
+        // Simply update the alarm count - no need to format data for notifications here
+        // The AlarmNotification component in Layout will handle the formatting and display
+        setLocalAlarmCount(prevCount => prevCount + 1);
+      }
     };
     
     // Register WebSocket listeners
@@ -432,7 +649,7 @@ const TelemetryDashboard = () => {
       socketService.removeListener('alarm', handleAlarmData);
       socketService.removeListener('alarm_notification', handleAlarmData);
     };
-  }, [realtimeEnabled]);
+  }, [realtimeEnabled, selectedDevice, initialDataLoaded, dataSource]);
   
   // Fetch devices when plant selection changes
   useEffect(() => {
@@ -488,81 +705,6 @@ const TelemetryDashboard = () => {
     
     fetchDevices();
   }, [selectedPlant]);
-  
-  const fetchLatestEntry = useCallback(async () => {
-    if (!selectedDevice) return;
-  
-    try {
-      const data = await getLatestTelemetryEntry(selectedDevice);
-      console.log("Latest telemetry entry:", data);
-      if (data) {
-        // Properly normalize the data structure
-        const normalized = {
-          alerts: Array.isArray(data.alerts) ? data.alerts : [],
-          temperature: typeof data.temperature === 'object' ? 
-            data.temperature.value : 
-            typeof data.temperature === 'number' ? 
-              data.temperature : 0,
-          humidity: typeof data.humidity === 'object' ? 
-            data.humidity.value : 
-            typeof data.humidity === 'number' ? 
-              data.humidity : 0,
-          oilLevel: typeof data.oilLevel === 'object' ? 
-            data.oilLevel.value : 
-            typeof data.oilLevel === 'number' ? 
-              data.oilLevel : 0
-        };
-
-        console.log("Normalized latest entry:", normalized);
-        setLatestEntry(normalized);
-        setConnectionStatus("connected");
-      } else {
-        setLatestEntry(null);
-        setConnectionStatus("no data");
-      }
-    } catch (error) {
-      console.error("❌ Error fetching latest telemetry:", error);
-      setLatestEntry(null);
-      setConnectionStatus("error");
-    }
-  }, [selectedDevice]);
-
-  const fetchRealtimeData = useCallback(async () => {
-    if (!selectedDevice) return;
-
-    try {
-      const data = await getRealtimeTelemetryData(selectedDevice);
-      setRealtimeData(data);
-    } catch (error) {
-      console.error("❌ Error fetching realtime data:", error);
-      setRealtimeData([]);
-    }
-  }, [selectedDevice]);
-  
-  const fetchHistoricalData = useCallback(async () => {
-    if (!selectedDevice) {
-      setTelemetryData([]);
-      return;
-    }
-   
-    try {
-      const data = await getTelemetryData(selectedDevice);
-      if (data?.length > 0) {
-        const processedData = data.map(entry => ({
-          ...entry,
-          temperature: entry.temperature?.value || entry.temperature || 0,
-          oilLevel: entry.oilLevel?.value || entry.oilLevel || 0,
-          timestamp: entry.timestamp
-        }));
-        
-        setTelemetryData(processedData.slice(0, 20));
-        setError(null);
-      }
-    } catch (error) {
-      console.error("❌ Error fetching historical data:", error);
-      setError("Failed to fetch telemetry data.");
-    }
-  }, [selectedDevice]);
   
   useEffect(() => {
     const fetchThreshold = async () => {
@@ -627,38 +769,49 @@ const TelemetryDashboard = () => {
     if (!selectedDevice) return;
     console.log(`Device selected: ${selectedDevice}, WebSocket enabled: ${realtimeEnabled}`);
     
-    // CRITICAL: Only fetch from API if WebSockets are disabled
-    if (!realtimeEnabled || !socketService.isConnected()) {
-      console.log('WebSockets inactive or disabled - using API for initial data');
-      // Initial data fetch only if WebSockets are not available
-      Promise.all([
-        fetchLatestEntry(),
-        fetchRealtimeData(),
-        fetchHistoricalData()
-      ]).then(() => {
-        setLoading(false);
-      });
-      
-      console.log('Setting up API polling intervals');
-      // Fallback to API polling if WebSockets aren't working
-      const latestInterval = setInterval(fetchLatestEntry, 3000);    // Every 3 seconds
-      const realtimeInterval = setInterval(fetchRealtimeData, 5000); // Every 5 seconds
-      const historicalInterval = setInterval(fetchHistoricalData, 15000); // Every 15 seconds
-      
-      return () => {
-        console.log('Cleaning up API polling intervals');
-        clearInterval(latestInterval);
-        clearInterval(realtimeInterval);
-        clearInterval(historicalInterval);
-      };
-    } else {
-      console.log('⚠️ WebSockets active - NO API CALLS will be made');
-      // When using WebSockets, just set loading state to false
+    // HYBRID APPROACH: Always load initial data via API, then use WebSockets for updates
+    console.log('🔍 Loading initial data via API for device:', selectedDevice);
+    setLoading(true);
+    
+    // Load initial data via API calls
+    window.initialDataLoadTime = Date.now(); // Track when we started loading
+    
+    Promise.all([
+      fetchLatestEntry(),
+      fetchRealtimeData(),
+      fetchHistoricalData()
+    ]).then(() => {
+      console.log('✅ Initial API data loaded successfully at', new Date().toLocaleTimeString());
       setLoading(false);
-      
-      // No intervals to return for cleanup
-      return () => {};
+      setInitialDataLoaded(true); // Mark initial data as loaded
+    }).catch(error => {
+      console.error('Error loading initial data:', error);
+      setLoading(false);
+    });
+    
+    // Set up different intervals based on WebSocket connection status
+    let latestInterval, realtimeInterval, historicalInterval;
+    
+    if (!realtimeEnabled || !socketService.isConnected()) {
+      console.log('⚠️ WebSockets inactive/disabled - using recurring API calls');
+      // If WebSockets are disabled or not connected, rely on regular API polling
+      latestInterval = setInterval(fetchLatestEntry, 3000);     // Every 3 seconds
+      realtimeInterval = setInterval(fetchRealtimeData, 5000);  // Every 5 seconds
+      historicalInterval = setInterval(fetchHistoricalData, 15000); // Every 15 seconds
+    } else {
+      console.log('📶 WebSockets active - Using WebSockets for real-time updates');
+      // When WebSockets are active, only poll historical data occasionally
+      // Real-time data will come from WebSockets
+      historicalInterval = setInterval(fetchHistoricalData, 30000); // Every 30 seconds
     }
+    
+    // Return cleanup function
+    return () => {
+      console.log('Cleaning up intervals');
+      if (latestInterval) clearInterval(latestInterval);
+      if (realtimeInterval) clearInterval(realtimeInterval);
+      if (historicalInterval) clearInterval(historicalInterval);
+    };
   }, [selectedDevice, fetchLatestEntry, fetchRealtimeData, fetchHistoricalData, realtimeEnabled, socketService]);
   
   const handlePlantChange = (e) => {
@@ -1126,6 +1279,8 @@ const TelemetryDashboard = () => {
     );
   };
 
+  // Empty section - notification functions removed
+  
   const dashboardContent = (
     <Container maxWidth="lg" sx={{ mt: 0.6, mb: 4 }}>
       <Typography variant="h4" fontWeight="bold" mb={3}>
