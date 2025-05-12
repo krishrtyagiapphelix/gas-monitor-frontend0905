@@ -1,14 +1,15 @@
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { getPlants } from "../services/plantService";
 import { getDevices } from "../services/deviceService";
 import { getThresholdValue, updateThresholdValue, getToleranceValue, updateToleranceValue } from '../services/telemetryService';
+import { fetchLatestTelemetry, fetchTelemetryData, fetchRealtimeTelemetry } from '../services/telemetryService';
+import socketService from '../services/socketService';
 import axios from 'axios';
 import Layout from "../components/Layout";
 import AlarmsTab from '../components/siteView/AlarmsTab';
 import { useLocation, useNavigate } from 'react-router-dom';
 
-
-import { 
+import {
   getLatestTelemetryEntry, 
   getRealtimeTelemetryData, 
   getTelemetryData,
@@ -160,14 +161,24 @@ const TelemetryDashboard = () => {
   const [plants, setPlants] = useState([]);
   const [devices, setDevices] = useState([]);
   const [selectedPlant, setSelectedPlant] = useState("");
-  const [selectedDevice, setSelectedDevice] = useState("esp32");
+  const [selectedDevice, setSelectedDevice] = useState('');
+  const [dataPeriod, setDataPeriod] = useState('1h');
   const [telemetryData, setTelemetryData] = useState([]);
-  const [latestEntry, setLatestEntry] = useState(null);
-  const [localAlarmCount, setLocalAlarmCount] = useState(0);
   const [realtimeData, setRealtimeData] = useState([]);
+  const [latestEntry, setLatestEntry] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [connectionStatus, setConnectionStatus] = useState("disconnected");
+  const [connectionStatus, setConnectionStatus] = useState('disconnected');
+  const [realtimeEnabled, setRealtimeEnabled] = useState(true);
+  const [localAlarmCount, setLocalAlarmCount] = useState(0);
+  
+  // Refs to track subscriptions
+  const activeDeviceRef = useRef(null);
+  const activePlantRef = useRef(null);
+  
+  // Map MongoDB device IDs to actual device identifiers used in EventHub
+  // This mapping ensures we subscribe to the right WebSocket channels
+  const [deviceIdMap, setDeviceIdMap] = useState({});
 
   // Get tab from URL or use default
   const tabFromURL = new URLSearchParams(location.search).get('tab');
@@ -257,32 +268,226 @@ const TelemetryDashboard = () => {
       }
     };
     fetchPlants();
-  }, []); // Run only once on mount
+  }, []);  // Load initial alarm count
+  useEffect(() => {
+    const fetchAlarmCount = async () => {
+      if (!selectedDevice) return;
+      
+      try {
+        // If you have an API endpoint for alarm count, use it here
+        // Example: const response = await axios.get(`/api/alarms/count?deviceId=${selectedDevice}`);
+        // setLocalAlarmCount(response.data.count);
+        
+        // For now, we'll use 0 as the initial count
+        setLocalAlarmCount(0);
+      } catch (error) {
+        console.error('Error fetching alarm count:', error);
+      }
+    };
+    
+    fetchAlarmCount();
+    
+    // Set up interval to refresh alarm count (optional)
+    const interval = setInterval(fetchAlarmCount, 60000); // Every minute
+    
+    return () => clearInterval(interval);
+  }, [selectedDevice]);
   
+  // When using WebSockets, block telemetry API calls
+  useEffect(() => {
+    if (realtimeEnabled) {
+      console.log('🛑 BLOCKING API CALLS: Setting up telemetry API blocker');
+      
+      // Create a function to patch the fetch API
+      const originalFetch = window.fetch;
+      window.fetch = function(url, options) {
+        // Block telemetry API calls when WebSockets are active
+        if (typeof url === 'string' && 
+           (url.includes('/api/telemetry') || 
+            url.includes('telemetryService'))) {
+          console.log(`🛑 BLOCKED API CALL to: ${url} - using WebSockets instead`);
+          // Return a mock response
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve([])
+          });
+        }
+        return originalFetch.apply(this, arguments);
+      };
+      
+      // Return cleanup function
+      return () => {
+        window.fetch = originalFetch;
+        console.log('🔄 Restored original fetch API');
+      };
+    }
+  }, [realtimeEnabled]);
 
+  // Initialize WebSocket connection
+  useEffect(() => {
+    // Connect to WebSocket server
+    socketService.connect();
+    
+    // Set up connection status handlers
+    socketService.onConnect(() => {
+      console.log('🔌 WebSocket connected - subscribing to data');
+      setConnectionStatus('connected');
+      
+      // IMPORTANT: Always subscribe to esp32_04 data when WebSocket connects 
+      // This ensures we get real-time data regardless of UI selection
+      console.log('🔵 Actively subscribing to esp32_04 device data');
+      socketService.subscribeToDevice('esp32_04');
+      
+      // Also subscribe to plant 2 (Plant D) which contains esp32_04
+      console.log('🏭 Actively subscribing to Plant D (ID: 2) data');
+      socketService.subscribeToPlant(2);
+      
+      // Resubscribe to previous device or plant if any
+      if (activeDeviceRef.current && activeDeviceRef.current !== 'esp32_04') {
+        socketService.subscribeToDevice(activeDeviceRef.current);
+      } else if (activePlantRef.current && activePlantRef.current !== 2) {
+        socketService.subscribeToPlant(activePlantRef.current);
+      }
+    });
+    
+    socketService.onDisconnect((reason) => {
+      console.log(`⚠️ WebSocket disconnected: ${reason}`);
+      setConnectionStatus('disconnected');
+    });
+    
+    // Clean up on component unmount
+    return () => {
+      socketService.disconnect();
+    };
+  }, []);
+  
+  // Set up WebSocket data listeners
+  useEffect(() => {
+    if (!realtimeEnabled) return;
+    
+    // Handler for telemetry data
+    const handleTelemetryData = (data) => {
+      const isEsp32_04 = (data.deviceId === 'esp32_04' || 
+                        (data.deviceName && data.deviceName.includes('esp32_04')) || 
+                        (data.device === 'esp32_04'));
+      
+      if (isEsp32_04) {
+        console.log('🔵 Received ESP32_04 WebSocket data:', data);
+      } else {
+        console.log('Received telemetry data via WebSocket:', data);
+      }
+      
+      // Force WebSocket connection status to connected
+      setConnectionStatus('connected');
+      
+      // Format data to match API format - ensuring all field variations are handled
+      const formattedData = {
+        deviceId: data.deviceId || data.device || data.DeviceId || '',
+        deviceName: data.deviceName || data.DeviceName || data.deviceId || data.device || 'Unknown',
+        temperature: typeof data.temperature !== 'undefined' ? data.temperature : 
+                    typeof data.Temperature !== 'undefined' ? data.Temperature : 0,
+        humidity: typeof data.humidity !== 'undefined' ? data.humidity : 
+                 typeof data.Humidity !== 'undefined' ? data.Humidity : 0,
+        oilLevel: typeof data.oilLevel !== 'undefined' ? data.oilLevel : 
+                 typeof data.OilLevel !== 'undefined' ? data.OilLevel : 0,
+        timestamp: new Date(data.timestamp || data.Timestamp || new Date()),
+        plantName: data.plantName || data.PlantName || ''
+      };
+      
+      // Display debugging information
+      console.log('Formatted WebSocket data:', formattedData);
+      
+      // Update latest entry
+      setLatestEntry(formattedData);
+      
+      // Add to realtime data (keeping it limited to prevent memory issues)
+      setRealtimeData(prevData => {
+        const newData = [formattedData, ...prevData];
+        return newData.slice(0, 50); // Keep only the latest 50 entries
+      });
+    };
+    
+    // Handler for alarm data
+    const handleAlarmData = (data) => {
+      console.log('Received alarm data via WebSocket:', data);
+      
+      // Increment alarm count
+      setLocalAlarmCount(prevCount => prevCount + 1);
+      
+      // Display alarm notification
+      toast.error(`Alarm: ${data.alarmDescription || data.AlarmDescription || 'Unknown'} (${data.deviceName || data.DeviceName || 'Unknown device'})`, {
+        position: "top-right",
+        autoClose: 5000,
+      });
+    };
+    
+    // Register WebSocket listeners
+    socketService.onTelemetry(handleTelemetryData);
+    socketService.onAlarm(handleAlarmData);
+    socketService.onAlarmNotification(handleAlarmData);
+    
+    // Clean up listeners on unmount or when realtime is disabled
+    return () => {
+      socketService.removeListener('telemetry', handleTelemetryData);
+      socketService.removeListener('alarm', handleAlarmData);
+      socketService.removeListener('alarm_notification', handleAlarmData);
+    };
+  }, [realtimeEnabled]);
+  
+  // Fetch devices when plant selection changes
   useEffect(() => {
     const fetchDevices = async () => {
       if (!selectedPlant) {
+        setDevices([]);
         return;
       }
-     
+
       try {
         setLoading(true);
-        const deviceData = await getDevices(selectedPlant);
-        setDevices(deviceData);
-        if (deviceData.length > 0) {
-          setSelectedDevice(deviceData[0]._id); // Use deviceId
+        const data = await getDevices(selectedPlant);
+        
+        if (data && data.length > 0) {
+          setDevices(data);
+          
+          // Build device ID mapping (MongoDB ID -> actual device ID)
+          const mapping = {};
+          data.forEach(device => {
+            // Map specific devices based on naming conventions
+            if (device.deviceName) {
+              if (device.deviceName.toLowerCase().includes('esp32_04')) {
+                mapping[device._id] = 'esp32_04';
+              } else if (device.deviceName.toLowerCase().includes('esp32_02')) {
+                mapping[device._id] = 'esp32_02';
+              } else if (device.deviceName.toLowerCase().includes('esp32')) {
+                mapping[device._id] = 'esp32';
+              } else {
+                // Use the MongoDB ID as a fallback
+                mapping[device._id] = device._id;
+              }
+              console.log(`Mapped ${device.deviceName} (${device._id}) → ${mapping[device._id]}`);
+            }
+          });
+          
+          console.log('Created device ID mapping:', mapping);
+          setDeviceIdMap(mapping);
+          
+          // Default to first device if none selected
+          if (!selectedDevice && data.length > 0) {
+            setSelectedDevice(data[0]._id);
+          }
+        } else {
+          setDevices([]);
         }
       } catch (error) {
-        console.error("❌ Error fetching devices:", error);
+        console.error('Error fetching devices:', error);
         setError("Failed to load devices. Please try again.");
       } finally {
         setLoading(false);
       }
     };
-  
+    
     fetchDevices();
-  }, [selectedPlant]); // Fetch devices when the plant selection changes
+  }, [selectedPlant]);
   
   const fetchLatestEntry = useCallback(async () => {
     if (!selectedDevice) return;
@@ -420,35 +625,90 @@ const TelemetryDashboard = () => {
   
   useEffect(() => {
     if (!selectedDevice) return;
-
-    // Initial data fetch - all at once
-    Promise.all([
-      fetchLatestEntry(),
-      fetchRealtimeData(),
-      fetchHistoricalData()
-    ]).then(() => {
+    console.log(`Device selected: ${selectedDevice}, WebSocket enabled: ${realtimeEnabled}`);
+    
+    // CRITICAL: Only fetch from API if WebSockets are disabled
+    if (!realtimeEnabled || !socketService.isConnected()) {
+      console.log('WebSockets inactive or disabled - using API for initial data');
+      // Initial data fetch only if WebSockets are not available
+      Promise.all([
+        fetchLatestEntry(),
+        fetchRealtimeData(),
+        fetchHistoricalData()
+      ]).then(() => {
+        setLoading(false);
+      });
+      
+      console.log('Setting up API polling intervals');
+      // Fallback to API polling if WebSockets aren't working
+      const latestInterval = setInterval(fetchLatestEntry, 3000);    // Every 3 seconds
+      const realtimeInterval = setInterval(fetchRealtimeData, 5000); // Every 5 seconds
+      const historicalInterval = setInterval(fetchHistoricalData, 15000); // Every 15 seconds
+      
+      return () => {
+        console.log('Cleaning up API polling intervals');
+        clearInterval(latestInterval);
+        clearInterval(realtimeInterval);
+        clearInterval(historicalInterval);
+      };
+    } else {
+      console.log('⚠️ WebSockets active - NO API CALLS will be made');
+      // When using WebSockets, just set loading state to false
       setLoading(false);
-    });
-
-    // Optimize intervals for better UX:
-    // - Faster initial updates
-    // - Longer display time for readability
-    // - Staggered updates to prevent simultaneous fetches
-    const latestInterval = setInterval(fetchLatestEntry, 3000);    // Every 3 seconds
-    const realtimeInterval = setInterval(fetchRealtimeData, 5000); // Every 5 seconds
-    const historicalInterval = setInterval(fetchHistoricalData, 15000); // Every 15 seconds
-
-    return () => {
-      clearInterval(latestInterval);
-      clearInterval(realtimeInterval);
-      clearInterval(historicalInterval);
-    };
-  }, [selectedDevice, fetchLatestEntry, fetchRealtimeData, fetchHistoricalData]);
+      
+      // No intervals to return for cleanup
+      return () => {};
+    }
+  }, [selectedDevice, fetchLatestEntry, fetchRealtimeData, fetchHistoricalData, realtimeEnabled, socketService]);
   
   const handlePlantChange = (e) => {
-    setSelectedPlant(e.target.value);
+    const plantId = e.target.value;
+    setSelectedPlant(plantId);
     setSelectedDevice("");
     clearDeviceCache();
+    
+    // Reset data states when plant changes
+    setTelemetryData([]);
+    setRealtimeData([]);
+    setLatestEntry(null);
+    setError(null);
+    
+    // Clear any active device subscription
+    if (activeDeviceRef.current) {
+      activeDeviceRef.current = null;
+    }
+    
+    // Subscribe to plant data on WebSocket
+    if (plantId && socketService.isConnected()) {
+      // Map plant MongoDB ID to numeric ID expected by backend
+      // The backend expects plantId as 1 (Plant C) or 2 (Plant D)
+      let numericPlantId;
+      
+      try {
+        // Look at the plant name to determine the correct numeric ID
+        const selectedPlantObj = plants.find(p => p._id === plantId);
+        if (selectedPlantObj) {
+          if (selectedPlantObj.plantName.includes('D')) {
+            numericPlantId = 2; // Plant D
+          } else {
+            numericPlantId = 1; // Plant C or other
+          }
+          console.log(`Mapped plant ${selectedPlantObj.plantName} (${plantId}) to numeric ID: ${numericPlantId}`);
+        } else {
+          console.warn(`Could not find plant with ID: ${plantId}`);
+          numericPlantId = plantId; // Fallback to original ID
+        }
+      } catch (err) {
+        console.error('Error mapping plant ID:', err);
+        numericPlantId = plantId; // Fallback to original ID
+      }
+      
+      console.log(`Subscribing to plant: ${numericPlantId}`);
+      socketService.subscribeToPlant(numericPlantId);
+      activePlantRef.current = numericPlantId;
+    } else {
+      activePlantRef.current = null;
+    }
   };
   
   const debouncedLoading = useCallback((value) => {
@@ -466,6 +726,32 @@ const TelemetryDashboard = () => {
     setRealtimeData([]);
     setLatestEntry(null);
     setError(null);
+    
+    // Update active subscriptions
+    if (activePlantRef.current) {
+      activePlantRef.current = null;
+    }
+    
+    if (newDeviceId) {
+      // Get the actual device identifier from our mapping
+      const actualDeviceId = deviceIdMap[newDeviceId] || newDeviceId;
+      
+      console.log(`Device selected: MongoDB ID ${newDeviceId} maps to actual device ID ${actualDeviceId}`);
+      
+      // Subscribe to new device on WebSocket using the actual device ID
+      if (socketService.isConnected()) {
+        socketService.subscribeToDevice(actualDeviceId);
+        activeDeviceRef.current = actualDeviceId;
+        console.log(`WebSocket subscribed to device: ${actualDeviceId}`);
+      }
+    } else {
+      activeDeviceRef.current = null;
+    }
+  };
+  
+  // Toggle realtime data updates
+  const toggleRealtime = () => {
+    setRealtimeEnabled(prev => !prev);
   };
   
   const getConnectionStatus = () => {
@@ -829,9 +1115,7 @@ const TelemetryDashboard = () => {
                   ))
                 ) : (
                   <TableRow>
-                    <TableCell colSpan={3} align="center">
-                      Waiting for real-time data...
-                    </TableCell>
+                    <TableCell colSpan={3} align="center">No data available</TableCell>
                   </TableRow>
                 )}
               </TableBody>
