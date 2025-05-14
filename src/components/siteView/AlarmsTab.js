@@ -40,23 +40,34 @@ const AlarmsTab = ({ selectedDevice }) => {
   // Use a ref to keep track of all alarms to avoid state update issues
   const alarmsRef = useRef([]);
   
-  // Load initial alarm data from API - only once per session
+  // Load initial alarm data - check cache first, only fetch from API if necessary
   useEffect(() => {
-    // Check if we've already loaded data in this session
-    if (initialApiCallMade && alarmsRef.current.length > 0) {
-      console.log('💾 Initial alarms already loaded in this session. Using cached data.');
-      // Just set loading to false and let WebSocket handle updates
-      setIsLoading(false);
-      return;
-    }
-
     let isMounted = true;
-    const fetchInitialAlarms = async () => {
+    
+    const loadAlarmsData = async () => {
       try {
         setIsLoading(true);
         setDataSource('loading');
         setError(null);
         
+        // Check if we have cached alarm data in socketService
+        const cachedData = socketService.getCachedAlarmData();
+        
+        if (cachedData.isLoaded && cachedData.data.length > 0) {
+          // Use cached data instead of making a new API call
+          console.log('💾 Using cached alarm data from previous session:', cachedData.data.length, 'items');
+          console.log('⏱️ Last fetch time:', new Date(cachedData.lastFetchTime).toLocaleString());
+          
+          if (isMounted) {
+            alarmsRef.current = cachedData.data;
+            setAlarms(cachedData.data);
+            setDataSource('cache');
+            setIsLoading(false);
+          }
+          return;
+        }
+        
+        // No cached data, fetch from API
         console.log(`🔄 Fetching initial alarms from MongoDB (oxygen-monitor database)${selectedDevice ? ` for device ${selectedDevice}` : ''}...`);
         
         // Fetch alarms from the API - either for a specific device or all alarms
@@ -71,8 +82,8 @@ const AlarmsTab = ({ selectedDevice }) => {
             alarmsRef.current = [];
             setAlarms([]);
             setDataSource('api');
-            // Even with no data, we've made our API call
-            setInitialApiCallMade(true);
+            // Cache the empty result too
+            socketService.cacheAlarmData([]);
           }
           return;
         }
@@ -112,8 +123,8 @@ const AlarmsTab = ({ selectedDevice }) => {
           alarmsRef.current = sortedAlarms;
           setAlarms(sortedAlarms);
           setDataSource('api');
-          // Mark that we've made our API call for this session
-          setInitialApiCallMade(true);
+          // Cache the data in socketService for persistence between tab switches
+          socketService.cacheAlarmData(sortedAlarms);
         }
       } catch (error) {
         console.error('❌ Error fetching initial alarms:', error);
@@ -129,54 +140,93 @@ const AlarmsTab = ({ selectedDevice }) => {
       }
     };
     
-    fetchInitialAlarms();
+    loadAlarmsData();
     
     // Cleanup function to prevent state updates if component unmounts
     return () => {
       isMounted = false;
-      // Do NOT reset initialApiCallMade on unmount - we want to keep that for the session
     };
-  }, [selectedDevice, initialApiCallMade]);
+  }, [selectedDevice]);
   
   // Handle new alarm data from WebSocket - only for new incoming alarms
   const handleNewAlarm = useCallback((alarmData) => {
-    if (!alarmData) return;
+    if (!alarmData) {
+      console.log('⚠️ Received empty alarm data via WebSocket');
+      return;
+    }
     
     console.log('📢 Received new alarm via WebSocket:', alarmData);
     
+    // Use more robust ID extraction and generation
+    let alarmId = 
+      alarmData._id || 
+      alarmData.id || 
+      alarmData.alarmId || 
+      alarmData.AlarmId || 
+      `alarm-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      
+    console.log(`🔍 Checking for existing alarm with ID: ${alarmId}`);
+    
     // Check if this alarm already exists to prevent duplicates
-    const alarmId = alarmData.id || alarmData._id || alarmData.AlarmId || '';
     const existingAlarmIndex = alarmsRef.current.findIndex(a => 
-      (a._id === alarmId) || (a.AlarmId === alarmId) ||
-      (alarmData.timestamp && a.CreatedTimestamp === alarmData.timestamp)
+      (a._id === alarmId) || 
+      (a.AlarmId === alarmId) ||
+      (alarmData.timestamp && a.CreatedTimestamp === alarmData.timestamp) ||
+      (alarmData.AlarmCode && a.AlarmCode === alarmData.AlarmCode && 
+       new Date(a.CreatedTimestamp).getTime() > Date.now() - 5000) // Within 5 seconds
     );
     
     if (existingAlarmIndex >= 0) {
-      console.log(`Skipping duplicate alarm with ID ${alarmId} - already in the list`);
+      console.log(`⏭️ Skipping duplicate alarm with ID ${alarmId} - already in the list at index ${existingAlarmIndex}`);
       return;
     }
     
     setDataSource('websocket');
     
-    // Format alarm data consistently
+    // Format alarm data consistently with more robust field extraction
     const formattedAlarm = {
-      _id: alarmId || `alarm-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      AlarmId: alarmData.id || alarmData.alarmId || alarmData.AlarmId || '',
-      AlarmCode: alarmData.alarmCode || alarmData.AlarmCode || '',
-      AlarmDescription: alarmData.description || alarmData.alarmDescription || alarmData.AlarmDescription || '',
-      CreatedTimestamp: alarmData.timestamp || alarmData.createdTimestamp || alarmData.CreatedTimestamp || new Date().toISOString(),
+      _id: alarmId,
+      AlarmId: alarmData.id || alarmData.alarmId || alarmData.AlarmId || alarmId,
+      AlarmCode: alarmData.alarmCode || alarmData.AlarmCode || alarmData.code || '',
+      AlarmDescription: 
+        alarmData.description || 
+        alarmData.alarmDescription || 
+        alarmData.AlarmDescription || 
+        alarmData.message || 
+        'Unknown alarm',
+      CreatedTimestamp: 
+        alarmData.timestamp || 
+        alarmData.createdTimestamp || 
+        alarmData.CreatedTimestamp || 
+        new Date().toISOString(),
       DeviceId: alarmData.deviceId || alarmData.DeviceId || '',
-      DeviceName: alarmData.deviceName || alarmData.DeviceName || '',
+      DeviceName: alarmData.deviceName || alarmData.DeviceName || 'Unknown Device',
       PlantName: alarmData.plantName || alarmData.PlantName || '',
       IsActive: true,
-      IsRead: false
+      IsRead: false,
+      Source: 'websocket' // Mark this as coming from WebSocket
     };
     
     console.log(`✅ Adding new alarm via WebSocket: ${formattedAlarm.AlarmCode} at ${formattedAlarm.CreatedTimestamp}`);
     
     // Add the new alarm at the top of the list (maintain descending timestamp order)
-    alarmsRef.current = [formattedAlarm, ...alarmsRef.current];
-    setAlarms([...alarmsRef.current]); // Create a new array to ensure React detects the change
+    const updatedAlarms = [formattedAlarm, ...alarmsRef.current];
+    
+    // Sort by timestamp in descending order (newest first) to ensure proper ordering
+    updatedAlarms.sort((a, b) => {
+      const dateA = new Date(a.CreatedTimestamp);
+      const dateB = new Date(b.CreatedTimestamp);
+      return dateB - dateA; // Descending order
+    });
+    
+    // Update the ref and state
+    alarmsRef.current = updatedAlarms;
+    
+    // Force a UI update with a new array reference
+    setAlarms([...updatedAlarms]); 
+    
+    // Also add to the socketService cache for persistence between tab switches
+    socketService.addAlarmToCache(formattedAlarm);
   }, []);
   
   // Connect to WebSocket for alarm updates - only for new incoming alarms after initial load
@@ -297,7 +347,7 @@ const AlarmsTab = ({ selectedDevice }) => {
       )}
       
       {/* Data Source and WebSocket Status */}
-      <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 2 }}>
+      {/* <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 2 }}>
         <Box>
           <Typography variant="body2" color="text.secondary">
             <span style={{ color: socketService.isConnected() ? 'green' : 'red' }}>
@@ -309,9 +359,9 @@ const AlarmsTab = ({ selectedDevice }) => {
             Data Source: {dataSource === 'api' ? 'API (Initial Load)' : 
                          dataSource === 'websocket' ? 'WebSocket (Real-time)' : 'Loading...'}
           </Typography>
-        </Box>
+        </Box> */}
         
-        <Button
+        {/* <Button
           onClick={clearAlarms}
           variant="outlined"
           size="small"
@@ -319,19 +369,32 @@ const AlarmsTab = ({ selectedDevice }) => {
         >
           Clear Alarms
         </Button>
-      </Box>
+      </Box> */}
 
       {/* Search Section */}
       <Paper elevation={2} sx={{ p: 2, mb: 2 }}>
-        <Box sx={{ display: 'flex', gap: 2, alignItems: 'center', mb: 2 }}>
-          <Typography>Search</Typography>
-          <input
-            type="text"
-            placeholder="Search by Alarm Code or Description"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            style={{ padding: '8px', width: '300px' }}
-          />
+        <Box sx={{ display: 'flex', alignItems: 'center', mb: 2, justifyContent: 'space-between' }}>
+          <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
+            <Typography>Search</Typography>
+            <input
+              type="text"
+              placeholder="Search by Alarm Code or Description"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              style={{ padding: '8px', width: '300px' }}
+            />
+          </Box>
+          <Button
+            variant="outlined"
+            size="small"
+            onClick={() => {
+              setSearchQuery('');
+              setFromDate('');
+              setToDate('');
+            }}
+          >
+            Clear Search
+          </Button>
         </Box>
         <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
           <Typography>From Date</Typography>
@@ -377,8 +440,18 @@ const AlarmsTab = ({ selectedDevice }) => {
 
                   // Apply date filters
                   const alarmDate = new Date(alarm.CreatedTimestamp);
-                  const matchesFromDate = !fromDate || alarmDate >= new Date(fromDate);
-                  const matchesToDate = !toDate || alarmDate <= new Date(toDate);
+                  
+                  // From Date - start of the day
+                  const fromDateObj = fromDate ? new Date(fromDate) : null;
+                  const matchesFromDate = !fromDate || alarmDate >= fromDateObj;
+                  
+                  // To Date - end of the day (23:59:59)
+                  let toDateObj = null;
+                  if (toDate) {
+                    toDateObj = new Date(toDate);
+                    toDateObj.setHours(23, 59, 59, 999); // Set to end of day
+                  }
+                  const matchesToDate = !toDate || alarmDate <= toDateObj;
 
                   return matchesSearch && matchesFromDate && matchesToDate;
                 })
