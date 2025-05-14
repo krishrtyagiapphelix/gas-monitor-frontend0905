@@ -10,6 +10,13 @@ class SocketService {
     this.connectionAttempts = 0;
     this.connectionCallbacks = [];
     this.disconnectionCallbacks = [];
+    
+    // Cache for persisting data between tab switches
+    this.cache = {
+      alarmsInitialDataLoaded: false,
+      alarmData: [], // Cache for alarm data
+      lastFetchTime: null // Timestamp of last API fetch
+    };
   }
 
   connect(url = process.env.REACT_APP_API_URL || 'http://localhost:5000') {
@@ -380,6 +387,74 @@ class SocketService {
   // Check if socket is connected - more robust check
   isConnected() {
     return this.connected && this.socket && this.socket.connected;
+  }
+
+  // Methods to handle alarm data persistence between tab changes
+  cacheAlarmData(alarmData) {
+    if (Array.isArray(alarmData) && alarmData.length > 0) {
+      this.cache.alarmData = [...alarmData];
+      this.cache.alarmsInitialDataLoaded = true;
+      this.cache.lastFetchTime = Date.now();
+      console.log('📦 Cached alarm data:', this.cache.alarmData.length, 'items');
+    }
+  }
+
+  getCachedAlarmData() {
+    return {
+      data: this.cache.alarmData,
+      isLoaded: this.cache.alarmsInitialDataLoaded,
+      lastFetchTime: this.cache.lastFetchTime
+    };
+  }
+
+  // Add a new alarm to the cache
+  addAlarmToCache(newAlarm) {
+    if (!newAlarm) return;
+
+    // Check if this alarm already exists to prevent duplicates
+    const alarmId = newAlarm.id || newAlarm._id || newAlarm.AlarmId || '';
+    const existingAlarmIndex = this.cache.alarmData.findIndex(a => 
+      (a._id === alarmId) || (a.AlarmId === alarmId) ||
+      (newAlarm.timestamp && a.CreatedTimestamp === newAlarm.timestamp)
+    );
+    
+    if (existingAlarmIndex >= 0) {
+      console.log(`Skipping duplicate alarm with ID ${alarmId} - already in cache`);
+      return;
+    }
+
+    // Format alarm data consistently
+    const formattedAlarm = {
+      _id: alarmId || `alarm-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      AlarmId: newAlarm.id || newAlarm.alarmId || newAlarm.AlarmId || '',
+      AlarmCode: newAlarm.alarmCode || newAlarm.AlarmCode || '',
+      AlarmDescription: newAlarm.description || newAlarm.alarmDescription || newAlarm.AlarmDescription || '',
+      CreatedTimestamp: newAlarm.timestamp || newAlarm.createdTimestamp || newAlarm.CreatedTimestamp || new Date().toISOString(),
+      DeviceId: newAlarm.deviceId || newAlarm.DeviceId || '',
+      DeviceName: newAlarm.deviceName || newAlarm.DeviceName || '',
+      PlantName: newAlarm.plantName || newAlarm.PlantName || '',
+      IsActive: true,
+      IsRead: false
+    };
+    
+    // Add the new alarm at the top of the list (maintain descending timestamp order)
+    this.cache.alarmData = [formattedAlarm, ...this.cache.alarmData];
+    console.log(`📝 Added new alarm to cache: ${formattedAlarm.AlarmCode}`);
+  }
+
+  markAlarmAsRead(alarmId) {
+    if (!alarmId) return;
+    
+    this.cache.alarmData = this.cache.alarmData.map(alarm => 
+      alarm._id === alarmId ? { ...alarm, IsRead: true } : alarm
+    );
+  }
+
+  clearAlarmCache() {
+    this.cache.alarmData = [];
+    this.cache.alarmsInitialDataLoaded = false;
+    this.cache.lastFetchTime = null;
+    console.log('🧹 Cleared alarm data cache');
   }
 }
 
