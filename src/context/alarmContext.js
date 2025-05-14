@@ -48,13 +48,13 @@ export const AlarmProvider = ({ children }) => {
     fetchAlarms();
     fetchUnreadCount();
 
-    const pollingInterval = setInterval(() => {
-      console.log('AlarmProvider: Polling for new data');
-      fetchAlarms();
-      fetchUnreadCount();
-    }, 30000);
+    // const pollingInterval = setInterval(() => {
+    //   console.log('AlarmProvider: Polling for new data');
+    //   fetchAlarms();
+    //   fetchUnreadCount();
+    // }, 30000);
 
-    return () => clearInterval(pollingInterval);
+    return () => {};
   }, []);
 
   const refreshData = () => {

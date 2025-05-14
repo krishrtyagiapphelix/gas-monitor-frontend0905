@@ -1,11 +1,11 @@
 import axios from 'axios';
  
-const API_BASE_URL = 'http://localhost:5000/api';
+const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:5000/api';
  
 // Create axios instance
 const api = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 5000,
+  timeout: 15000, // Increase timeout to 15 seconds to handle slower database connections
 });
  
 // Add request interceptor to include JWT token in headers

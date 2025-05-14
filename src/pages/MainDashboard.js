@@ -99,8 +99,9 @@ const MainDashboard = () => {
     
     fetchAlarms();
     // Refresh alarms every 30 seconds
-    const interval = setInterval(fetchAlarms, 30000);
-    return () => clearInterval(interval);
+    // const interval = setInterval(fetchAlarms, 30000);
+    // return () => clearInterval(interval);
+    return () => {};
   }, []);
 
   return (

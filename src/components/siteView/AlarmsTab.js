@@ -20,14 +20,15 @@ import {
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import WarningIcon from '@mui/icons-material/Warning';
 import InfoIcon from '@mui/icons-material/Info';
-import { markAlarmAsRead } from '../../services/alarmService';
+import { markAlarmAsRead, getAllAlarms, getAlarmsByDevice } from '../../services/alarmService';
 import socketService from '../../services/socketService';
 
-const AlarmsTab = () => {
-  // Use WebSocket-only approach for alarms
+const AlarmsTab = ({ selectedDevice }) => {
+  // Use hybrid approach: initial data via API, then WebSocket for updates
   const [alarms, setAlarms] = useState([]);
-  const [isLoading, setIsLoading] = useState(false);
+  const [isLoading, setIsLoading] = useState(true); // Start with loading state
   const [error, setError] = useState(null);
+  const [dataSource, setDataSource] = useState('loading'); // 'api', 'websocket', or 'loading'
   
   // UI state
   const [page, setPage] = useState(0);
@@ -36,47 +37,213 @@ const AlarmsTab = () => {
   const [toDate, setToDate] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
   
-  // This ref will store all alarm data received via WebSocket
+  // Use a ref to keep track of all alarms to avoid state update issues
   const alarmsRef = useRef([]);
   
-  // Handle new alarm data from WebSocket
-  const handleNewAlarm = (alarmData) => {
+  // Flag to track if the initial API call has been made in this session
+  const [initialApiCallMade, setInitialApiCallMade] = useState(false);
+  
+  // Load initial alarm data from API - only once per session
+  useEffect(() => {
+    // Check if we've already loaded data in this session
+    if (initialApiCallMade && alarmsRef.current.length > 0) {
+      console.log('💾 Initial alarms already loaded in this session. Using cached data.');
+      // Just set loading to false and let WebSocket handle updates
+      setIsLoading(false);
+      return;
+    }
+
+    let isMounted = true;
+    const fetchInitialAlarms = async () => {
+      try {
+        setIsLoading(true);
+        setDataSource('loading');
+        setError(null);
+        
+        console.log(`🔄 Fetching initial alarms from MongoDB (oxygen-monitor database)${selectedDevice ? ` for device ${selectedDevice}` : ''}...`);
+        
+        // Fetch alarms from the API - either for a specific device or all alarms
+        const data = selectedDevice 
+          ? await getAlarmsByDevice(selectedDevice)
+          : await getAllAlarms();
+        
+        // Handle no data case
+        if (!data || data.length === 0) {
+          console.log('⚠️ No alarms found in MongoDB database');
+          if (isMounted) {
+            alarmsRef.current = [];
+            setAlarms([]);
+            setDataSource('api');
+            // Even with no data, we've made our API call
+            setInitialApiCallMade(true);
+          }
+          return;
+        }
+          
+        console.log('🔍 Fetched initial alarms from API:', data.length);
+        console.log('📄 First alarm sample:', data[0]);
+        
+        // Format the alarm data and ensure all fields are present
+        // The backend now provides normalized data, but we'll still do some client-side validation
+        const formattedAlarms = data.map(alarm => ({
+          _id: alarm._id || `alarm-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+          AlarmId: alarm.AlarmId || alarm.alarmId || alarm.id || '',
+          AlarmCode: alarm.AlarmCode || alarm.alarmCode || '',
+          AlarmDescription: alarm.AlarmDescription || alarm.alarmDescription || alarm.description || '',
+          CreatedTimestamp: alarm.CreatedTimestamp || alarm.createdTimestamp || alarm.timestamp || new Date().toISOString(),
+          DeviceId: alarm.DeviceId || alarm.deviceId || '',
+          DeviceName: alarm.DeviceName || alarm.deviceName || 'Unknown Device',
+          PlantName: alarm.PlantName || alarm.plantName || '',
+          IsActive: typeof alarm.IsActive !== 'undefined' ? alarm.IsActive : 
+                   typeof alarm.isActive !== 'undefined' ? alarm.isActive : true,
+          IsRead: typeof alarm.IsRead !== 'undefined' ? alarm.IsRead : 
+                 typeof alarm.isRead !== 'undefined' ? alarm.isRead : false
+        }));
+        
+        // Sort by timestamp in descending order (newest first)
+        const sortedAlarms = formattedAlarms.sort((a, b) => {
+          const dateA = new Date(a.CreatedTimestamp);
+          const dateB = new Date(b.CreatedTimestamp);
+          return dateB - dateA; // Descending order
+        });
+        
+        // Log sample of final formatted data
+        console.log('✅ Alarm data formatted successfully. Sample:', sortedAlarms[0]);
+        
+        // Update the alarms state if component is still mounted
+        if (isMounted) {
+          alarmsRef.current = sortedAlarms;
+          setAlarms(sortedAlarms);
+          setDataSource('api');
+          // Mark that we've made our API call for this session
+          setInitialApiCallMade(true);
+        }
+      } catch (error) {
+        console.error('❌ Error fetching initial alarms:', error);
+        if (isMounted) {
+          setError(`Failed to load alarms data from MongoDB: ${error.message || 'Unknown error'}.`);
+          alarmsRef.current = [];
+          setAlarms([]);
+        }
+      } finally {
+        if (isMounted) {
+          setIsLoading(false);
+        }
+      }
+    };
+    
+    fetchInitialAlarms();
+    
+    // Cleanup function to prevent state updates if component unmounts
+    return () => {
+      isMounted = false;
+      // Do NOT reset initialApiCallMade on unmount - we want to keep that for the session
+    };
+  }, [selectedDevice, initialApiCallMade]);
+  
+  // Handle new alarm data from WebSocket - only for new incoming alarms
+  const handleNewAlarm = useCallback((alarmData) => {
     if (!alarmData) return;
     
     console.log('📢 Received new alarm via WebSocket:', alarmData);
     
+    // Check if this alarm already exists to prevent duplicates
+    const alarmId = alarmData.id || alarmData._id || alarmData.AlarmId || '';
+    const existingAlarmIndex = alarmsRef.current.findIndex(a => 
+      (a._id === alarmId) || (a.AlarmId === alarmId) ||
+      (alarmData.timestamp && a.CreatedTimestamp === alarmData.timestamp)
+    );
+    
+    if (existingAlarmIndex >= 0) {
+      console.log(`Skipping duplicate alarm with ID ${alarmId} - already in the list`);
+      return;
+    }
+    
+    setDataSource('websocket');
+    
     // Format alarm data consistently
     const formattedAlarm = {
-      _id: alarmData.id || `alarm-${Date.now()}`,
-      AlarmId: alarmData.id || alarmData.alarmId || '',
-      AlarmCode: alarmData.alarmCode || '',
-      AlarmDescription: alarmData.description || alarmData.alarmDescription || '',
-      CreatedTimestamp: alarmData.timestamp || alarmData.createdTimestamp || new Date().toISOString(),
-      DeviceId: alarmData.deviceId || '',
-      DeviceName: alarmData.deviceName || '',
-      PlantName: alarmData.plantName || '',
+      _id: alarmId || `alarm-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      AlarmId: alarmData.id || alarmData.alarmId || alarmData.AlarmId || '',
+      AlarmCode: alarmData.alarmCode || alarmData.AlarmCode || '',
+      AlarmDescription: alarmData.description || alarmData.alarmDescription || alarmData.AlarmDescription || '',
+      CreatedTimestamp: alarmData.timestamp || alarmData.createdTimestamp || alarmData.CreatedTimestamp || new Date().toISOString(),
+      DeviceId: alarmData.deviceId || alarmData.DeviceId || '',
+      DeviceName: alarmData.deviceName || alarmData.DeviceName || '',
+      PlantName: alarmData.plantName || alarmData.PlantName || '',
       IsActive: true,
       IsRead: false
     };
     
-    // Update the alarms list with the new alarm at the top
-    alarmsRef.current = [formattedAlarm, ...alarmsRef.current];
-    setAlarms(alarmsRef.current);
-  };
-  
-  // Connect to WebSocket for alarm updates
-  useEffect(() => {
-    // Set up WebSocket listeners for alarms
-    socketService.onAlarm(handleNewAlarm);
-    socketService.onAlarmNotification(handleNewAlarm);
+    console.log(`✅ Adding new alarm via WebSocket: ${formattedAlarm.AlarmCode} at ${formattedAlarm.CreatedTimestamp}`);
     
-    setIsLoading(false); // No loading state needed since we're using WebSockets only
+    // Add the new alarm at the top of the list (maintain descending timestamp order)
+    alarmsRef.current = [formattedAlarm, ...alarmsRef.current];
+    setAlarms([...alarmsRef.current]); // Create a new array to ensure React detects the change
+  }, []);
+  
+  // Connect to WebSocket for alarm updates - only for new incoming alarms after initial load
+  useEffect(() => {
+    // First check if socket is already connected
+    const isSocketConnected = socketService.isConnected();
+    console.log(`🔗 WebSocket connection status: ${isSocketConnected ? 'Connected' : 'Disconnected'}`);
+    
+    // Set up WebSocket connection once at component mount
+    if (!isSocketConnected) {
+      console.log('🔌 Connecting to WebSocket server for real-time alarms...');
+      socketService.connect();
+      
+      // Add a reconnect handler for window focus events
+      const handleFocus = () => {
+        console.log('👁️ Window focused - checking WebSocket connection');
+        if (!socketService.isConnected()) {
+          console.log('🔄 Reconnecting WebSocket after focus');
+          socketService.connect();
+        }
+      };
+      
+      window.addEventListener('focus', handleFocus);
+      return () => window.removeEventListener('focus', handleFocus);
+    }
+    
+    // We only want to set up listeners once the initial API data is loaded
+    // or if the WebSocket connection changes
+    if (!isLoading && (dataSource === 'api' || dataSource === 'websocket')) {
+      console.log('💬 Setting up WebSocket listeners for new incoming alarms...');
+      
+      // Remove any existing listeners first to avoid duplicates
+      socketService.removeListener('alarm', handleNewAlarm);
+      socketService.removeListener('alarm_notification', handleNewAlarm);
+      
+      // Add new listeners
+      socketService.onAlarm(handleNewAlarm);
+      socketService.onAlarmNotification(handleNewAlarm);
+      
+      console.log('✅ WebSocket alarm listeners successfully set up');
+    }
     
     // Clean up on component unmount
     return () => {
+      console.log('🗑 Cleaning up WebSocket alarm listeners...');
       socketService.removeListener('alarm', handleNewAlarm);
       socketService.removeListener('alarm_notification', handleNewAlarm);
     };
+  }, [isLoading, dataSource, handleNewAlarm]);
+  
+  // Effect to maintain socket connection
+  useEffect(() => {
+    // Setup ping interval to keep WebSocket connection alive
+    const pingInterval = setInterval(() => {
+      if (socketService.isConnected()) {
+        // No need to actually send a ping - just checking the connection
+        console.log('👁 WebSocket connection active');
+      } else {
+        console.log('🔄 WebSocket disconnected - attempting reconnect');
+        socketService.connect();
+      }
+    }, 30000); // Check every 30 seconds
+    
+    return () => clearInterval(pingInterval);
   }, []);
  
   const handleChangePage = (event, newPage) => {
@@ -126,19 +293,26 @@ const AlarmsTab = () => {
         </Alert>
       )}
       
-      {alarms.length === 0 && !isLoading && (
+      {alarms.length === 0 && !isLoading && !error && (
         <Alert severity="info" sx={{ mb: 2 }} icon={<InfoIcon />}>
-          No alarms received yet. WebSocket is listening for new alarms.
+          No alarms found in MongoDB database. WebSocket is listening for new alarms.
         </Alert>
       )}
       
-      {/* WebSocket Status and Clear Button */}
+      {/* Data Source and WebSocket Status */}
       <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 2 }}>
-        <Typography variant="body2" color="text.secondary">
-          <span style={{ color: socketService.isConnected() ? 'green' : 'red' }}>
-            ●
-          </span> WebSocket {socketService.isConnected() ? 'Connected' : 'Disconnected'}
-        </Typography>
+        <Box>
+          <Typography variant="body2" color="text.secondary">
+            <span style={{ color: socketService.isConnected() ? 'green' : 'red' }}>
+              ●
+            </span> WebSocket {socketService.isConnected() ? 'Connected' : 'Disconnected'}
+          </Typography>
+          
+          <Typography variant="body2" color="text.secondary">
+            Data Source: {dataSource === 'api' ? 'API (Initial Load)' : 
+                         dataSource === 'websocket' ? 'WebSocket (Real-time)' : 'Loading...'}
+          </Typography>
+        </Box>
         
         <Button
           onClick={clearAlarms}
@@ -219,14 +393,15 @@ const AlarmsTab = () => {
                     <TableCell>{alarm.DeviceName || '-'}</TableCell>
                     <TableCell>
                       {alarm.CreatedTimestamp ? 
-                        new Date(alarm.CreatedTimestamp).toLocaleString('en-US', {
-                          year: 'numeric',
-                          month: '2-digit',
+                        new Date(alarm.CreatedTimestamp).toLocaleString('en-GB', {
                           day: '2-digit',
+                          month: '2-digit',
+                          year: 'numeric',
                           hour: '2-digit',
                           minute: '2-digit',
-                          second: '2-digit'
-                        }) : '-'}
+                          second: '2-digit',
+                          hour12: false
+                        }).replace(',', '') : '-'}
                     </TableCell>
                     <TableCell>{alarm.AlarmDescription || '-'}</TableCell>
                     <TableCell>
