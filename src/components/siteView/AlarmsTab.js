@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Box,
   Typography,
@@ -39,9 +39,6 @@ const AlarmsTab = ({ selectedDevice }) => {
   
   // Use a ref to keep track of all alarms to avoid state update issues
   const alarmsRef = useRef([]);
-  
-  // Flag to track if the initial API call has been made in this session
-  const [initialApiCallMade, setInitialApiCallMade] = useState(false);
   
   // Load initial alarm data from API - only once per session
   useEffect(() => {
