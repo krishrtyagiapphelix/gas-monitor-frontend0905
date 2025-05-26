@@ -93,9 +93,20 @@ function TabPanel(props) {
 }
 
 // Custom circular progress visualization component that matches the reference UI
-const MetricCircle = ({ value, label, color, size = 100, thickness = 5 }) => {
+const MetricCircle = ({ value, label, color, size = 100, thickness = 5, timestamp }) => {
   const theme = useTheme();
   const displayValue = value || 0;
+  
+  // Format the timestamp for display
+  let formattedTimestamp = '';
+  if (timestamp) {
+    try {
+      const date = new Date(timestamp);
+      formattedTimestamp = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    } catch (err) {
+      console.error('Error formatting timestamp:', err);
+    }
+  }
   
   return (
     <Box sx={{ 
@@ -143,6 +154,11 @@ const MetricCircle = ({ value, label, color, size = 100, thickness = 5 }) => {
       <Typography variant="body1" component="div">
         {label}
       </Typography>
+      {timestamp && (
+        <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5 }}>
+          Updated: {formattedTimestamp}
+        </Typography>
+      )}
     </Box>
   );
 };
@@ -566,20 +582,40 @@ const TelemetryDashboard = () => {
       
       // Update UI state with the new data
       if (data) {
+        // Check if this is a partial update
+        const isPartialUpdate = data._partialUpdate !== false;
+        
         // Format the data for UI components
         const formattedData = {
-          timestamp: new Date(data.receivedTimestamp || data.timestamp || new Date()).toISOString(),
-          temperature: data.temperature || 0,
-          humidity: data.humidity || 0,
+          timestamp: new Date(data.receivedTimestamp || data.timestamp || data._lastUpdated || new Date()).toISOString(),
+          // Use parameter timestamps if available
+          temperature: {
+            value: data.temperature || 0,
+            timestamp: data._parameterTimestamps?.temperature ? 
+              new Date(data._parameterTimestamps.temperature).toISOString() : 
+              new Date(data.receivedTimestamp || data.timestamp || new Date()).toISOString()
+          },
+          humidity: {
+            value: data.humidity || 0,
+            timestamp: data._parameterTimestamps?.humidity ? 
+              new Date(data._parameterTimestamps.humidity).toISOString() : 
+              new Date(data.receivedTimestamp || data.timestamp || new Date()).toISOString()
+          },
+          oilLevel: {
+            value: data.oilLevel || 0,
+            timestamp: data._parameterTimestamps?.oilLevel ? 
+              new Date(data._parameterTimestamps.oilLevel).toISOString() : 
+              new Date(data.receivedTimestamp || data.timestamp || new Date()).toISOString()
+          },
           distance: data.distance || 0,
           alcoholLevel: data.alcoholLevel || data.alcohol || 0,
-          oilLevel: data.oilLevel || 0,
           deviceId: data.deviceId || data.device,
-          plantName: data.plantName
+          plantName: data.plantName,
+          _partialUpdate: isPartialUpdate
         };
         
         // Log important values for monitoring
-        console.log(`📈 WebSocket data - Temp: ${formattedData.temperature}°C | Humidity: ${formattedData.humidity}% | Time: ${formattedData.timestamp}`);
+        console.log(`📈 WebSocket data - Temp: ${formattedData.temperature.value}°C (Updated: ${formattedData.temperature.timestamp}) | Humidity: ${formattedData.humidity.value}% (Updated: ${formattedData.humidity.timestamp}) | Time: ${formattedData.timestamp}`);
         
         // Check if this data is for the currently selected device
         const deviceId = data.deviceId || data.device;
@@ -591,27 +627,61 @@ const TelemetryDashboard = () => {
           (selectedDevice && selectedDevice.toString().includes(deviceId));
         
         if (isForSelectedDevice) {
-          console.log(`🔵 Updating UI with real-time data via WebSocket`);
+          console.log(`🔵 Updating UI with real-time data via WebSocket (Partial: ${isPartialUpdate})`);
           
           // 1. Update latest telemetry entry (for metric circles)
           setLatestEntry(prev => ({
             ...prev,
-            temperature: formattedData.temperature,
-            humidity: formattedData.humidity,
-            oilLevel: formattedData.oilLevel
+            temperature: formattedData.temperature.value,
+            humidity: formattedData.humidity.value,
+            oilLevel: formattedData.oilLevel.value,
+            temperatureTimestamp: formattedData.temperature.timestamp,
+            humidityTimestamp: formattedData.humidity.timestamp,
+            oilLevelTimestamp: formattedData.oilLevel.timestamp
           }));
           
           // 2. Update device data (for dashboard header)
-          setDeviceData(prevData => ({ ...prevData, ...formattedData }));
+          setDeviceData(prevData => ({ 
+            ...prevData, 
+            ...{
+              timestamp: formattedData.timestamp,
+              temperature: formattedData.temperature.value,
+              humidity: formattedData.humidity.value,
+              oilLevel: formattedData.oilLevel.value,
+              temperatureTimestamp: formattedData.temperature.timestamp,
+              humidityTimestamp: formattedData.humidity.timestamp,
+              oilLevelTimestamp: formattedData.oilLevel.timestamp,
+              deviceId: formattedData.deviceId,
+              plantName: formattedData.plantName
+            }
+          }));
           
           // 3. Update real-time data table (add new entry at top)
           setRealtimeData(prevData => {
+            // Format data for the table
+            const tableEntry = {
+              timestamp: formattedData.timestamp,
+              temperature: formattedData.temperature.value,
+              humidity: formattedData.humidity.value,
+              oilLevel: formattedData.oilLevel.value,
+              temperatureTimestamp: formattedData.temperature.timestamp,
+              humidityTimestamp: formattedData.humidity.timestamp,
+              oilLevelTimestamp: formattedData.oilLevel.timestamp
+            };
+            
             // Create new array with new data at the beginning
-            return [formattedData, ...prevData.slice(0, 19)];
+            return [tableEntry, ...prevData.slice(0, 19)];
           });
           
           // 4. Add new point to real-time graph
-          addRealtimeDataPoint(formattedData);
+          // For the graph we need simple values
+          const graphDataPoint = {
+            timestamp: formattedData.timestamp,
+            temperature: formattedData.temperature.value,
+            humidity: formattedData.humidity.value,
+            oilLevel: formattedData.oilLevel.value
+          };
+          addRealtimeDataPoint(graphDataPoint);
           
           // Force WebSocket connection status to connected
           setConnectionStatus('connected');
@@ -1148,21 +1218,25 @@ const TelemetryDashboard = () => {
             value={latestEntry.alerts?.length || 0}
             label="Open Alerts" 
             color="#f44336"
+            timestamp={latestEntry.alerts?.length > 0 ? latestEntry.alerts[latestEntry.alerts.length - 1].timestamp : null}
           />
           <MetricCircle 
             value={Number(latestEntry.temperature).toFixed(1)}
             label="Temperature" 
             color="#ff9800"
+            timestamp={latestEntry.temperatureTimestamp}
           />
           <MetricCircle 
             value={Number(latestEntry.humidity).toFixed(1)}
             label="Humidity" 
             color="#2196f3"
+            timestamp={latestEntry.humidityTimestamp}
           />
           <MetricCircle 
             value={Number(latestEntry.oilLevel).toFixed(1)}
             label="Oil Level" 
             color="#4caf50"
+            timestamp={latestEntry.oilLevelTimestamp}
           />
         </Box>
       </Box>
@@ -1240,7 +1314,11 @@ const TelemetryDashboard = () => {
                 <TableRow>
                   <TableCell>Timestamp</TableCell>
                   <TableCell>Temperature (°C)</TableCell>
+                  <TableCell>Last Updated</TableCell>
+                  <TableCell>Humidity (%)</TableCell>
+                  <TableCell>Last Updated</TableCell>
                   <TableCell>Oil Level (%)</TableCell>
+                  <TableCell>Last Updated</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
@@ -1258,17 +1336,42 @@ const TelemetryDashboard = () => {
                           : '0'}
                       </TableCell>
                       <TableCell>
+                        {item.temperatureTimestamp 
+                          ? new Date(item.temperatureTimestamp).toLocaleTimeString([], 
+                            { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+                          : '-'}
+                      </TableCell>
+                      <TableCell>
+                        {typeof item.humidity === 'object' && item.humidity.value !== undefined
+                          ? item.humidity.value
+                          : typeof item.humidity === 'number'
+                          ? item.humidity
+                          : '0'}
+                      </TableCell>
+                      <TableCell>
+                        {item.humidityTimestamp 
+                          ? new Date(item.humidityTimestamp).toLocaleTimeString([], 
+                            { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+                          : '-'}
+                      </TableCell>
+                      <TableCell>
                         {typeof item.oilLevel === 'object' && item.oilLevel.value !== undefined
                           ? item.oilLevel.value
                           : typeof item.oilLevel === 'number'
                           ? item.oilLevel
                           : '0'}
                       </TableCell>
+                      <TableCell>
+                        {item.oilLevelTimestamp 
+                          ? new Date(item.oilLevelTimestamp).toLocaleTimeString([], 
+                            { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+                          : '-'}
+                      </TableCell>
                     </TableRow>
                   ))
                 ) : (
                   <TableRow>
-                    <TableCell colSpan={3} align="center">No data available</TableCell>
+                    <TableCell colSpan={7} align="center">No data available</TableCell>
                   </TableRow>
                 )}
               </TableBody>
